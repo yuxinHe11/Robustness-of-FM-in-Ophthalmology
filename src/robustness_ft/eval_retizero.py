@@ -1,0 +1,490 @@
+import argparse
+import os
+import json
+from pathlib import Path
+from itertools import combinations
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+
+def norm_str(x):
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+
+def standardize_csv(csv_path, image_root, diseases):
+    df = pd.read_csv(csv_path)
+    df = df.rename(columns={
+        "label": "disease",
+        "patientID": "patient_id",
+        "relative_path": "image",
+    })
+
+    required = ["disease", "patient_id", "eye", "equipment"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}. Current columns: {list(df.columns)}")
+
+    if "image" not in df.columns:
+        if "filename" not in df.columns:
+            raise ValueError("CSV must contain image / relative_path / filename.")
+        df["image"] = df["filename"]
+
+    keep = [x.strip() for x in diseases.split(",") if x.strip()]
+    if keep:
+        df = df[df["disease"].astype(str).isin(keep)].copy()
+    if len(df) == 0:
+        raise ValueError(f"No samples after disease filtering: {keep}")
+
+    for c in [
+        "image", "disease", "patient_id", "eye", "equipment",
+        "shooting_date", "sex", "gender_code", "date_of_birth", "age_at_shooting"
+    ]:
+        if c in df.columns:
+            df[c] = df[c].map(norm_str)
+
+    def resolve(p):
+        p = str(p)
+        if os.path.isabs(p):
+            return p
+        return os.path.join(image_root, p) if image_root else p
+
+    df["image_path"] = df["image"].apply(resolve)
+
+    for c in ["sex", "gender_code", "date_of_birth", "age_at_shooting", "shooting_date"]:
+        if c not in df.columns:
+            df[c] = ""
+
+    return df.reset_index(drop=True)
+
+
+def infer_class_order(diseases, positive_label, class_order):
+    if class_order:
+        classes = [x.strip() for x in class_order.split(",") if x.strip()]
+    else:
+        labels = [x.strip() for x in diseases.split(",") if x.strip()]
+        health_like = [x for x in labels if x.lower() in ["health", "healthy", "normal", "control"]]
+        others = [x for x in labels if x not in health_like]
+        classes = health_like + sorted(others)
+
+    if positive_label not in classes:
+        raise ValueError(f"positive_label={positive_label} not in classes={classes}")
+
+    return classes, classes.index(positive_label)
+
+
+def summarize(vals):
+    vals = np.asarray(vals, dtype=np.float64)
+    vals = vals[~np.isnan(vals)]
+    if len(vals) == 0:
+        return {"n": 0, "mean": np.nan, "std": np.nan}
+    return {
+        "n": int(len(vals)),
+        "mean": float(np.mean(vals)),
+        "std": float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0,
+    }
+
+
+def build_prediction_pairs(pred):
+    rows = []
+
+    for _, g in pred.groupby(["patient_id", "eye", "disease"], sort=False):
+        if g["equipment"].nunique() < 2:
+            continue
+
+        idxs = sorted(
+            g.index.tolist(),
+            key=lambda k: (str(pred.at[k, "equipment"]), str(pred.at[k, "image_path"]))
+        )
+
+        for i, j in combinations(idxs, 2):
+            if pred.at[i, "equipment"] == pred.at[j, "equipment"]:
+                continue
+
+            p_i = float(pred.at[i, "prob_positive"])
+            p_j = float(pred.at[j, "prob_positive"])
+
+            pred_pos_i = int(pred.at[i, "pred_label"] == pred.at[i, "positive_label"])
+            pred_pos_j = int(pred.at[j, "pred_label"] == pred.at[j, "positive_label"])
+
+            rows.append({
+                "disease": pred.at[i, "disease"],
+                "patient_id": pred.at[i, "patient_id"],
+                "eye": pred.at[i, "eye"],
+                "equipment_i": pred.at[i, "equipment"],
+                "equipment_j": pred.at[j, "equipment"],
+                "equipment_pair": f"{pred.at[i, 'equipment']} -> {pred.at[j, 'equipment']}",
+                "image_i": pred.at[i, "image_path"],
+                "image_j": pred.at[j, "image_path"],
+                "prob_positive_i": p_i,
+                "prob_positive_j": p_j,
+                "probability_shift_signed": p_j - p_i,
+                "probability_shift_abs": abs(p_j - p_i),
+                "pred_i": pred.at[i, "pred_label"],
+                "pred_j": pred.at[j, "pred_label"],
+                "prediction_consistent": float(pred.at[i, "pred_label"] == pred.at[j, "pred_label"]),
+                "target_positive_i": int(pred.at[i, "target_positive"]),
+                "target_positive_j": int(pred.at[j, "target_positive"]),
+                "pred_positive_i": pred_pos_i,
+                "pred_positive_j": pred_pos_j,
+                "both_correct_binary": float(
+                    int(pred.at[i, "target_positive"]) == pred_pos_i
+                    and int(pred.at[j, "target_positive"]) == pred_pos_j
+                ),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def evaluate_prediction_robustness(pred):
+    detail = build_prediction_pairs(pred)
+    rows = []
+
+    for dis in sorted(pred["disease"].unique().tolist()):
+        g = detail[detail["disease"] == dis] if len(detail) else pd.DataFrame()
+        rows.append({
+            "metric": "probability_shift_signed",
+            "disease": dis,
+            **summarize(g["probability_shift_signed"].values if len(g) else [])
+        })
+        rows.append({
+            "metric": "prediction_consistency",
+            "disease": dis,
+            **summarize(g["prediction_consistent"].values if len(g) else [])
+        })
+
+    rows.append({
+        "metric": "probability_shift_signed",
+        "disease": "ALL",
+        **summarize(detail["probability_shift_signed"].values if len(detail) else [])
+    })
+    rows.append({
+        "metric": "prediction_consistency",
+        "disease": "ALL",
+        **summarize(detail["prediction_consistent"].values if len(detail) else [])
+    })
+
+    pair_rows = []
+    if len(detail) > 0:
+        for (dis, pair), g in detail.groupby(["disease", "equipment_pair"]):
+            pair_rows.append({
+                "disease": dis,
+                "equipment_pair": pair,
+                "metric": "probability_shift_signed",
+                **summarize(g["probability_shift_signed"].values)
+            })
+            pair_rows.append({
+                "disease": dis,
+                "equipment_pair": pair,
+                "metric": "prediction_consistency",
+                **summarize(g["prediction_consistent"].values)
+            })
+
+    return pd.DataFrame(rows), detail, pd.DataFrame(pair_rows)
+
+
+def evaluate_classification_metrics(pred, classes, positive_index):
+    from sklearn.metrics import (
+        roc_auc_score,
+        average_precision_score,
+        f1_score,
+        accuracy_score,
+        balanced_accuracy_score,
+        confusion_matrix,
+    )
+
+    y_true = pred["target_positive"].astype(int).values
+    y_prob = pred["prob_positive"].astype(float).values
+    y_pred = (pred["pred_index"].astype(int).values == int(positive_index)).astype(int)
+
+    out = {
+        "n": int(len(y_true)),
+        "n_positive": int((y_true == 1).sum()),
+        "n_negative": int((y_true == 0).sum()),
+        "positive_label": classes[positive_index],
+        "negative_label": classes[1 - positive_index] if len(classes) == 2 else "",
+        "auroc": np.nan,
+        "auprc": np.nan,
+        "weighted_f1": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+        "macro_f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
+        "acc": accuracy_score(y_true, y_pred),
+        "bacc": balanced_accuracy_score(y_true, y_pred),
+    }
+
+    if len(np.unique(y_true)) == 2:
+        out["auroc"] = roc_auc_score(y_true, y_prob)
+        out["auprc"] = average_precision_score(y_true, y_prob)
+
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
+
+    out["tn"] = tn
+    out["fp"] = fp
+    out["fn"] = fn
+    out["tp"] = tp
+
+    out["sensitivity"] = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+    out["specificity"] = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    out["ppv"] = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+    out["npv"] = tn / (tn + fn) if (tn + fn) > 0 else np.nan
+
+    return pd.DataFrame([out])
+
+
+def save_outputs(args, pred, classes, positive_index):
+    out_dir = Path(args.output_dir) / args.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pred.to_csv(out_dir / "predictions.csv", index=False)
+
+    cls_metrics = evaluate_classification_metrics(pred, classes, positive_index)
+    cls_metrics.insert(0, "run_name", args.run_name)
+    cls_metrics.to_csv(out_dir / "classification_metrics.csv", index=False)
+
+    summary, detail, by_equipment = evaluate_prediction_robustness(pred)
+    summary.insert(0, "run_name", args.run_name)
+    summary.to_csv(out_dir / "prediction_robustness_summary.csv", index=False)
+    detail.to_csv(out_dir / "prediction_robustness_pair_detail.csv", index=False)
+    by_equipment.to_csv(out_dir / "prediction_robustness_by_equipment_pair.csv", index=False)
+
+    with open(out_dir / "config.json", "w", encoding="utf-8") as f:
+        cfg = vars(args).copy()
+        cfg["class_order_final"] = classes
+        cfg["positive_index"] = positive_index
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+    print("\nClassification metrics:")
+    print(cls_metrics.to_string(index=False))
+    print("\nPrediction robustness summary:")
+    print(summary.to_string(index=False))
+    print(f"\nSaved to: {out_dir}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--csv", type=str, required=True)
+    p.add_argument("--image_root", type=str, required=True)
+    p.add_argument("--diseases", type=str, default="health,Glaucoma")
+    p.add_argument("--positive_label", type=str, default="Glaucoma")
+    p.add_argument("--class_order", type=str, default="health,Glaucoma")
+    p.add_argument("--num_classes", type=int, default=2)
+
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--cuda", type=str, default="2")
+    p.add_argument("--amp", action="store_true")
+
+    p.add_argument("--output_dir", type=str, required=True)
+    p.add_argument("--run_name", type=str, default="glaucoma")
+
+    p.add_argument("--retizero_repo", type=str, required=True)
+    p.add_argument("--weight_path", type=str, required=True)
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--vision_type", type=str, default="lora")
+    p.add_argument("--module_name", type=str, default="iden_modules")
+    p.add_argument("--r", type=int, default=8)
+    p.add_argument("--image_size", type=int, default=224)
+    p.add_argument("--freeze_encoder", action="store_true")
+
+    return p.parse_args()
+
+
+def build_loader(args, df):
+    import torch
+    from PIL import Image
+    from torch.utils.data import Dataset, DataLoader
+    from src.utils_retizero import default_retizero_transform
+
+    transform = default_retizero_transform(args.image_size)
+
+    class FundusDataset(Dataset):
+        def __init__(self, df):
+            self.df = df.reset_index(drop=True)
+
+        def __len__(self):
+            return len(self.df)
+
+        def __getitem__(self, idx):
+            path = self.df.iloc[idx]["image_path"]
+            try:
+                img = Image.open(path).convert("RGB")
+                img = transform(img)
+            except Exception as e:
+                raise RuntimeError(f"Failed to read image: {path}") from e
+            return {"image": img, "idx": idx}
+
+    def collate_fn(batch):
+        return {
+            "image": torch.stack([b["image"] for b in batch], dim=0),
+            "idx": [b["idx"] for b in batch],
+        }
+
+    return DataLoader(
+        FundusDataset(df),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+
+def get_state_dict(ckpt):
+    if isinstance(ckpt, dict):
+        for key in [
+            "model_state",
+            "model_state_dict",
+            "state_dict",
+            "model",
+            "module",
+        ]:
+            if key in ckpt and isinstance(ckpt[key], dict):
+                return ckpt[key]
+    return ckpt
+
+
+def strip_module_prefix(state):
+    return {
+        k.replace("module.", "", 1) if k.startswith("module.") else k: v
+        for k, v in state.items()
+    }
+
+
+def attach_predictions(df, logits_all, probs_all, classes, positive_index):
+    pred_idx = probs_all.argmax(axis=1)
+    pred_label = [classes[i] if i < len(classes) else str(i) for i in pred_idx]
+
+    out = df.copy()
+
+    for k in range(probs_all.shape[1]):
+        name = classes[k] if k < len(classes) else f"class{k}"
+        out[f"logit_{name}"] = logits_all[:, k]
+        out[f"prob_{name}"] = probs_all[:, k]
+
+    out["pred_index"] = pred_idx
+    out["pred_label"] = pred_label
+    out["positive_label"] = classes[positive_index]
+    out["prob_positive"] = probs_all[:, positive_index]
+    out["target_positive"] = (out["disease"] == classes[positive_index]).astype(int)
+
+    return out
+
+
+def check_checkpoint_label_map(ckpt, classes):
+    label_map = ckpt.get("label_map", None)
+    if label_map is None:
+        print("[WARN] Checkpoint has no label_map.")
+        return
+
+    print("Checkpoint label_map:", label_map)
+
+    # 仅提醒，不强行报错，因为 AMD/glaucoma 外部 CSV 是字符串标签。
+    if set(map(str, label_map.keys())) == {"0", "1"}:
+        expected = ["health", "AMD"]
+    elif set(map(str, label_map.keys())) == {"2", "3"}:
+        expected = ["health", "Glaucoma"]
+    else:
+        expected = None
+
+    if expected is not None and classes != expected:
+        print(f"[WARN] class_order={classes}, but checkpoint label_map suggests {expected}")
+
+
+def run_inference(args, df, classes, positive_index):
+    import torch
+    from src.utils_retizero import RetiZeroClassifier
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    loader = build_loader(args, df)
+
+    model = RetiZeroClassifier(
+        retizero_repo=args.retizero_repo,
+        weight_path=args.weight_path,
+        num_classes=args.num_classes,
+        vision_type=args.vision_type,
+        module_name=args.module_name,
+        freeze_encoder=args.freeze_encoder,
+        r=args.r,
+    ).to(device)
+
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+
+    print("Checkpoint keys:", list(ckpt.keys()) if isinstance(ckpt, dict) else type(ckpt))
+    if isinstance(ckpt, dict):
+        print("Checkpoint epoch:", ckpt.get("epoch", None))
+        print("Checkpoint metrics:", ckpt.get("metrics", None))
+        check_checkpoint_label_map(ckpt, classes)
+
+    state = strip_module_prefix(get_state_dict(ckpt))
+    msg = model.load_state_dict(state, strict=False)
+
+    print(f"Loaded RetiZero checkpoint: {args.checkpoint}")
+    print(f"Missing keys: {len(msg.missing_keys)}")
+    print(f"Unexpected keys: {len(msg.unexpected_keys)}")
+
+    if len(msg.missing_keys):
+        print("Missing keys first 50:", msg.missing_keys[:50])
+    if len(msg.unexpected_keys):
+        print("Unexpected keys first 50:", msg.unexpected_keys[:50])
+
+    bad_missing = [
+        k for k in msg.missing_keys
+        if "classifier" in k or "head" in k or "fc" in k
+    ]
+    if bad_missing:
+        raise RuntimeError(f"Classifier/head weights were not loaded: {bad_missing}")
+
+    model.eval()
+
+    logits_all = np.zeros((len(df), args.num_classes), dtype=np.float32)
+    probs_all = np.zeros((len(df), args.num_classes), dtype=np.float32)
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc=f"Infer {args.run_name}"):
+            images = batch["image"].to(device, non_blocking=True)
+
+            with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
+                logits = model(images)
+                if isinstance(logits, (tuple, list)):
+                    logits = logits[0]
+                probs = torch.softmax(logits, dim=1)
+
+            idxs = np.asarray(batch["idx"], dtype=int)
+            logits_all[idxs] = logits.float().cpu().numpy()
+            probs_all[idxs] = probs.float().cpu().numpy()
+
+    return attach_predictions(df, logits_all, probs_all, classes, positive_index)
+
+
+def main():
+    args = parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
+
+    classes, positive_index = infer_class_order(
+        args.diseases,
+        args.positive_label,
+        args.class_order,
+    )
+
+    if len(classes) != args.num_classes:
+        raise ValueError(
+            f"num_classes={args.num_classes}, but class_order has {len(classes)} classes: {classes}"
+        )
+
+    print("Final class_order:", classes)
+    print("Positive label/index:", args.positive_label, positive_index)
+
+    df = standardize_csv(args.csv, args.image_root, args.diseases)
+    print("External eval samples:")
+    print(df["disease"].value_counts().to_string())
+
+    pred = run_inference(args, df, classes, positive_index)
+    save_outputs(args, pred, classes, positive_index)
+
+
+if __name__ == "__main__":
+    main()
