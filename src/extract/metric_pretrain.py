@@ -118,14 +118,12 @@ for metric in df["metric"].dropna().unique():
 
         row += 1
 
-    # 全部左对齐 + 边框
     for r in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
         for cell in r:
             cell.alignment = Alignment(horizontal="left", vertical="center")
             if cell.row >= 2:
                 cell.border = border
 
-    # 列宽
     ws.column_dimensions["A"].width = 28
     for col in range(2, ws.max_column + 1):
         ws.column_dimensions[get_column_letter(col)].width = 22
